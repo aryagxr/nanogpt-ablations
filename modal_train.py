@@ -13,8 +13,9 @@ LOGS_DIR  = "/mnt/logs"
 
 
 image = (
-    modal.Image.from_registry("pytorch/pytorch:2.5.1-cuda12.1-cudnn9-devel")
+    modal.Image.debian_slim(python_version="3.11")
     .pip_install(
+        "torch==2.5.1",
         "numpy",
         "wandb",
         "huggingface_hub",
@@ -25,15 +26,15 @@ image = (
 
 # data
 
+MAX_SHARDS = 103  # kjj0/fineweb10B-gpt2 has shards 000001–000103
+
 @app.function(
     image=image,
     volumes={DATA_DIR: DATA_VOL},
     cpu=4,
     memory=8192,
-    timeout=7200, 
+    timeout=7200,
 )
-MAX_SHARDS = 103  #from kjj0/fineweb10B-gpt2
-
 def download_data(num_shards: int = 9):
     """
     Download pre-tokenised FineWeb shards from HuggingFace (kjj0/fineweb10B-gpt2).
