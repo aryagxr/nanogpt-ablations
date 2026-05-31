@@ -32,6 +32,39 @@ def rmsnorm(x0, eps=1e-6):
     x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
     return x.type_as(x0)
 
+
+class RoPE(nn.Module):
+    def __init__(self, emb_dim, base=10000):
+        super().__init__()
+        #self attributes
+        self.freqs = 1 / (base ** (torch.arange(0, emb_dim, 2) / emb_dim))
+
+
+    #return cos and sin
+    def forward(self, x):
+        # x: (B, T, nh, head_dim)
+        seq_len = x.shape[1]
+        pos = torch.arange(seq_len, device=x.device).float()
+        theta = torch.outer(pos, self.freqs.to(x.device)) #(T, head_dim//2)
+        cos_theta = torch.cos(theta).unsqueeze(0).unsqueeze(2) #(1, T, 1, head_dim//2)
+        sin_theta = torch.sin(theta).unsqueeze(0).unsqueeze(2) #(1, T, 1, head_dim//2)
+        return cos_theta, sin_theta  #broadcast over B and nh in rope_rotate
+
+
+
+def rope_rotate(tok, cos, sin):
+    #forming pairs
+    x_even = tok[...,0::2] #even
+    y_odd = tok[..., 1::2] #odd
+    x_rot = x_even * cos - y_odd * sin
+    y_rot = x_even * sin + y_odd * cos
+    #reconstruct the embedding again
+    out = torch.stack([x_rot, y_rot], dim=-1)
+    out = out.flatten(-2)
+    return out
+
+
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -44,18 +77,27 @@ class CausalSelfAttention(nn.Module):
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        self.head_dim = self.n_embd // self.n_head
+        self.rope = RoPE(self.head_dim)
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # flash attn
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-        # output projection
+        # reshape to (B, T, nh, hs) first so rope sees T at dim 1
+        q = q.view(B, T, self.n_head, self.head_dim)  # (B, T, nh, hs)
+        k = k.view(B, T, self.n_head, self.head_dim)
+        v = v.view(B, T, self.n_head, self.head_dim)
+        cos, sin = self.rope(q)  
+        q = rope_rotate(q, cos, sin)
+        k = rope_rotate(k, cos, sin)
+        # now transpose to (B, nh, T, hs) for flash attention
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
         y = y / math.sqrt(24)
         return y
@@ -104,7 +146,7 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            # wpe = nn.Embedding(config.block_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -120,12 +162,10 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None, return_logits=True):
         b, t = idx.size()
         assert t <= self.config.block_size
-        pos = torch.arange(0, t, dtype=torch.long, device=idx.device)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = tok_emb + pos_emb
+        tok_emb = self.transformer.wte(idx) # (b, t, n_embd)
+        x = tok_emb  # no absolute position embedding — RoPE handles position inside attention
 
         for block in self.transformer.h:
             x = block(x)

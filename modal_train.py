@@ -13,8 +13,9 @@ LOGS_DIR  = "/mnt/logs"
 
 
 image = (
-    modal.Image.from_registry("pytorch/pytorch:2.5.1-cuda12.1-cudnn9-devel")
+    modal.Image.debian_slim(python_version="3.11")
     .pip_install(
+        "torch==2.5.1",
         "numpy",
         "wandb",
         "huggingface_hub",
