@@ -27,6 +27,53 @@ import wandb
 
 
 
+#orthogonalize gradient with ns iterations
+#using quintic iteration
+#only for 2d matrices
+#other dimenional matrices go through AdamW
+def zeropower_via_newtonschulz(G, ns_steps):
+    assert G.dim >= 2
+    a, b, c = (3.4445, -4.7750,  2.0315)
+    X = G.bfloat16()
+    #if tall matrix, transpose
+    #muon more stable with wider matrices
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    
+    #frobenius norm, make sure 1
+    X = X / (X.norm(dim=(-2,-1), keepdim=True) + 1e-7)
+    #ns iterations
+    for step in range(ns_steps):
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+
+    #transpose back the tall matrices
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    return X
+
+
+#update the weights
+#takes in the gradient
+#smoothens gradient using momentum
+#orthogonalize it
+#rescale
+def muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True):
+    #ema
+    momentum.lerp__(grad, 1 - beta)
+    update = grad.lerp_(momentum, beta) if nesterov else momentum
+    if update.ndim == 4: # for the case of conv filters
+        update = update.view(len(update), -1)
+    update = zeropower_via_newtonschulz(update, steps=ns_steps)
+    update *= max(1, update.size(-2) / update.size(-1))**0.5
+    return update
+
+
+
+
+
 def rmsnorm(x0, eps=1e-6):
     x = x0.float()
     x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
@@ -186,12 +233,12 @@ class GPT(nn.Module):
 
         return logits, loss
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        optimizer = torch.optim.AdamW(
-            self.parameters(), lr=learning_rate,
-            weight_decay=weight_decay, betas=betas,
-        )
-        return optimizer
+    # def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    #     optimizer = torch.optim.AdamW(
+    #         self.parameters(), lr=learning_rate,
+    #         weight_decay=weight_decay, betas=betas,
+    #     )
+    #     return optimizer
 
 
 
@@ -410,12 +457,12 @@ if __name__ == "__main__":
 
 
     # Optimizer
-    optimizer = raw_model.configure_optimizers(
-        weight_decay=args.weight_decay,
-        learning_rate=args.learning_rate,
-        betas=(0.9, 0.95),
-        device_type=device,
-    )
+    # optimizer = raw_model.configure_optimizers(
+    #     weight_decay=args.weight_decay,
+    #     learning_rate=args.learning_rate,
+    #     betas=(0.9, 0.95),
+    #     device_type=device,
+    # )
 
     # LR schedule: linear warmup then linear decay to 10% of peak
     def get_lr(it):
