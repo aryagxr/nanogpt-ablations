@@ -212,7 +212,7 @@ class CausalSelfAttention(nn.Module):
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
-        y = y / math.sqrt(24)
+        # y = y / math.sqrt(24)
         return y
 
 class MLP(nn.Module):
@@ -250,7 +250,7 @@ class GPTConfig:
     block_size: int = 1024
     vocab_size: int = 50257
     n_layer: int = 12
-    n_head: int = 12
+    n_head: int = 6
     n_embd: int = 768
 
 class GPT(nn.Module):
