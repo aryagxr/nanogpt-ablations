@@ -102,7 +102,6 @@ def train(
         "--learning_rate",   "1.5e-3",
         "--warmup_iters",    "700",
         "--weight_decay",    "0.1",
-        "--grad_clip",       "1.0",
         "--val_loss_every",  "250",
         "--val_max_steps",   "20",
     ]

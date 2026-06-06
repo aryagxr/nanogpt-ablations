@@ -184,6 +184,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.c_proj.weight.data.zero_()
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -202,6 +203,8 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rope(q)  
         q = rope_rotate(q, cos, sin)
         k = rope_rotate(k, cos, sin)
+        #QKNorm
+        q, k = rmsnorm(q), rmsnorm(k)
         # now transpose to (B, nh, T, hs) for flash attention
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
@@ -209,7 +212,7 @@ class CausalSelfAttention(nn.Module):
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
-        y = y / math.sqrt(24)
+        # y = y / math.sqrt(24)
         return y
 
 class MLP(nn.Module):
@@ -218,10 +221,12 @@ class MLP(nn.Module):
         super().__init__()
         self.c_fc   = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_proj.weight.data.zero_()
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = F.gelu(x)
+        # https://arxiv.org/abs/2109.08668v2
+        x = F.relu(x).square()
         x = self.c_proj(x)
         return x
 
@@ -245,7 +250,7 @@ class GPTConfig:
     block_size: int = 1024
     vocab_size: int = 50257
     n_layer: int = 12
-    n_head: int = 12
+    n_head: int = 6
     n_embd: int = 768
 
 class GPT(nn.Module):
@@ -414,7 +419,6 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_iters",  type=int,   default=700,
                         help="linear LR warmup steps")
     parser.add_argument("--weight_decay",  type=float, default=0.1)
-    parser.add_argument("--grad_clip",     type=float, default=1.0)
     parser.add_argument("--grad_accum_steps", type=int, default=4,
                         help="gradient accumulation steps (set automatically if 0)")
     # evaluation
@@ -490,7 +494,10 @@ if __name__ == "__main__":
     # Build model
     model_configs = {
         # vocab padded to nearest multiple of 128 for better tensor-core utilisation
-        "d12": GPTConfig(block_size=1024, vocab_size=50304, n_layer=12, n_head=12, n_embd=768),
+        #changing n_heads to 6, so that n_heads(6) x head_dim(128) = n_embd(768)
+        #since 128 head dim better for qknorm
+        #see https://x.com/kellerjordan0/status/1845865698532450646
+        "d12": GPTConfig(block_size=1024, vocab_size=50304, n_layer=12, n_head=6, n_embd=768),
     }
     model = GPT(model_configs[args.model]).train().cuda()
 
@@ -546,7 +553,6 @@ if __name__ == "__main__":
     
     # Training loop
     ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
-    norm         = -1.0
     tokens_seen  = 0
     training_time_ms = 0
 
@@ -652,8 +658,6 @@ if __name__ == "__main__":
                     (loss / grad_accum_steps).backward()
             train_loss = loss.detach()  # loss of last micro-batch (for logging)
 
-        norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.grad_clip)
-
         lr_schedule = get_lr(step)
         for pg in optimizer.param_groups:
             if pg['use_muon']:
@@ -674,7 +678,7 @@ if __name__ == "__main__":
                 f"train_time:{approx_time:.0f}ms "
                 f"step_avg:{approx_time / timed_steps:.2f}ms "
                 f"tokens_seen:{tokens_seen:.2e} "
-                f"lr_scale:{lr_schedule:.3e} norm:{norm:.3f}",
+                f"lr_scale:{lr_schedule:.3e}",
                 console=True,
             )
             if not args.disable_wandb:
@@ -685,7 +689,6 @@ if __name__ == "__main__":
                     "step_avg": approx_time / timed_steps,
                     "tokens_seen": tokens_seen,
                     "lr": lr_schedule,
-                    "grad_norm": norm,
                 })
 
     # -------------------------------------------------------------------------
