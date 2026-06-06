@@ -27,6 +27,116 @@ import wandb
 
 
 
+#orthogonalize gradient with ns iterations
+#using quintic iteration
+#only for 2d matrices
+#other dimenional matrices go through AdamW
+def zeropower_via_newtonschulz(G, ns_steps):
+    assert G.ndim >= 2
+    a, b, c = (3.4445, -4.7750,  2.0315)
+    X = G.bfloat16()
+    #if tall matrix, transpose
+    #muon more stable with wider matrices
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    
+    #frobenius norm, make sure 1
+    X = X / (X.norm(dim=(-2,-1), keepdim=True) + 1e-7)
+    #ns iterations
+    for step in range(ns_steps):
+        A = X @ X.mT
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+
+    #transpose back the tall matrices
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    return X
+
+
+#update the weights
+#takes in the gradient
+#smoothens gradient using momentum
+#orthogonalize it
+#rescale
+def muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True):
+    #ema
+    momentum.lerp_(grad, 1 - beta)
+    update = grad.lerp_(momentum, beta) if nesterov else momentum
+    if update.ndim == 4: # for the case of conv filters
+        update = update.view(len(update), -1)
+    update = zeropower_via_newtonschulz(update, ns_steps)
+    update *= max(1, update.size(-2) / update.size(-1))**0.5
+    return update
+
+
+def adam_update(grad, buf1, buf2, step, betas, eps):
+    buf1.lerp_(grad, 1 - betas[0])
+    buf2.lerp_(grad.square(), 1 - betas[1])
+    buf1c = buf1 / (1 - betas[0]**step)
+    buf2c = buf2 / (1 - betas[1]**step)
+    return buf1c / (buf2c.sqrt() + eps)
+
+
+
+# https://github.com/KellerJordan/Muon/blob/master/muon.py#L228
+class Muon(torch.optim.Optimizer):
+    def __init__(self, param_groups):
+        for group in param_groups:
+            assert "use_muon" in group
+            if group["use_muon"]:
+                # defaults
+                group["lr"] = group.get("lr", 0.02)
+                group["momentum"] = group.get("momentum", 0.95)
+                group["weight_decay"] = group.get("weight_decay", 0)
+                assert set(group.keys()) == set(["params", "lr", "momentum", "weight_decay", "use_muon"])
+            else:
+                # defaults
+                group["lr"] = group.get("lr", 3e-4)
+                group["betas"] = group.get("betas", (0.9, 0.95))
+                group["eps"] = group.get("eps", 1e-10)
+                group["weight_decay"] = group.get("weight_decay", 0)
+                assert set(group.keys()) == set(["params", "lr", "betas", "eps", "weight_decay", "use_muon"])
+        super().__init__(param_groups, dict())
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            if group['use_muon']:
+                #muon update for 2d layers
+                for p in group['params']:
+                    if p.grad is None:
+                        continue
+                    #state to remember prev momentum
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state['momentum_buffer'] = torch.zeros_like(p)
+                    #ema of past gradients
+                    mbuf = state['momentum_buffer']
+                    update = muon_update(p.grad, mbuf, beta=group['momentum'])
+                    #weight decay w ← (1 − lr * weight_decay) w
+                    p.mul_(1 - group['lr'] * group['weight_decay'])
+                    #w ← w + update * -lr
+                    p.add_(update.reshape(p.shape), alpha=-group['lr'])
+
+            else:
+                #adam for linear
+                for p in group['params']:
+                    if p.grad is None:
+                        continue
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state['exp_avg'] = torch.zeros_like(p)
+                        state['exp_avg_sq'] = torch.zeros_like(p)
+                        state['step'] = 0
+                    state['step'] += 1
+                    update = adam_update(p.grad, state['exp_avg'], state['exp_avg_sq'], state['step'], group['betas'], group['eps'])
+                    p.mul_(1 - group['lr'] * group['weight_decay'])
+                    p.add_(update, alpha=-group['lr'])
+
+
+
 def rmsnorm(x0, eps=1e-6):
     x = x0.float()
     x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
@@ -186,12 +296,12 @@ class GPT(nn.Module):
 
         return logits, loss
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        optimizer = torch.optim.AdamW(
-            self.parameters(), lr=learning_rate,
-            weight_decay=weight_decay, betas=betas,
-        )
-        return optimizer
+    # def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    #     optimizer = torch.optim.AdamW(
+    #         self.parameters(), lr=learning_rate,
+    #         weight_decay=weight_decay, betas=betas,
+    #     )
+    #     return optimizer
 
 
 
@@ -409,24 +519,29 @@ if __name__ == "__main__":
         )
 
 
-    # Optimizer
-    optimizer = raw_model.configure_optimizers(
-        weight_decay=args.weight_decay,
-        learning_rate=args.learning_rate,
-        betas=(0.9, 0.95),
-        device_type=device,
-    )
+    #Optimizer
+    # optimizer = raw_model.configure_optimizers(
+    #     weight_decay=args.weight_decay,
+    #     learning_rate=args.learning_rate,
+    #     betas=(0.9, 0.95),
+    #     device_type=device,
+    # )
+    param_groups = [
+    dict(params=list(raw_model.transformer.h.parameters()), use_muon=True),
+    dict(params=list(raw_model.lm_head.parameters()), use_muon=False, lr=args.learning_rate, betas=(0.9, 0.95), eps=1e-8, weight_decay=args.weight_decay),
+    ]
+    optimizer = Muon(param_groups)
 
     # LR schedule: linear warmup then linear decay to 10% of peak
     def get_lr(it):
         assert it <= args.num_iterations
         # 1) linear warmup for warmup_iters steps
         if it < args.warmup_iters:
-            return args.learning_rate * (it + 1) / args.warmup_iters
+            return (it + 1) / args.warmup_iters
         decay_ratio = (it - args.warmup_iters) / (args.num_iterations - args.warmup_iters)
         assert 0.0 <= decay_ratio <= 1.0
         # linear decay from 1.0 → 0.1 of peak lr
-        return (0.1 + (1.0 - decay_ratio) * 0.9) * args.learning_rate
+        return (0.1 + (1.0 - decay_ratio) * 0.9)
 
     
     # Training loop
@@ -539,9 +654,12 @@ if __name__ == "__main__":
 
         norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.grad_clip)
 
-        lr = get_lr(step)
+        lr_schedule = get_lr(step)
         for pg in optimizer.param_groups:
-            pg['lr'] = lr
+            if pg['use_muon']:
+                pg['lr'] = 0.02 * lr_schedule
+            else:
+                pg['lr'] = args.learning_rate * lr_schedule
         optimizer.step()
 
 
@@ -556,7 +674,7 @@ if __name__ == "__main__":
                 f"train_time:{approx_time:.0f}ms "
                 f"step_avg:{approx_time / timed_steps:.2f}ms "
                 f"tokens_seen:{tokens_seen:.2e} "
-                f"lr:{lr:.2e} norm:{norm:.3f}",
+                f"lr_scale:{lr_schedule:.3e} norm:{norm:.3f}",
                 console=True,
             )
             if not args.disable_wandb:
@@ -566,7 +684,7 @@ if __name__ == "__main__":
                     "step": step + 1,
                     "step_avg": approx_time / timed_steps,
                     "tokens_seen": tokens_seen,
-                    "lr": lr,
+                    "lr": lr_schedule,
                     "grad_norm": norm,
                 })
 
