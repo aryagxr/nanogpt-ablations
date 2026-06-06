@@ -419,7 +419,6 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_iters",  type=int,   default=700,
                         help="linear LR warmup steps")
     parser.add_argument("--weight_decay",  type=float, default=0.1)
-    parser.add_argument("--grad_clip",     type=float, default=1.0)
     parser.add_argument("--grad_accum_steps", type=int, default=4,
                         help="gradient accumulation steps (set automatically if 0)")
     # evaluation
@@ -554,7 +553,6 @@ if __name__ == "__main__":
     
     # Training loop
     ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
-    norm         = -1.0
     tokens_seen  = 0
     training_time_ms = 0
 
@@ -660,8 +658,6 @@ if __name__ == "__main__":
                     (loss / grad_accum_steps).backward()
             train_loss = loss.detach()  # loss of last micro-batch (for logging)
 
-        norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.grad_clip)
-
         lr_schedule = get_lr(step)
         for pg in optimizer.param_groups:
             if pg['use_muon']:
@@ -682,7 +678,7 @@ if __name__ == "__main__":
                 f"train_time:{approx_time:.0f}ms "
                 f"step_avg:{approx_time / timed_steps:.2f}ms "
                 f"tokens_seen:{tokens_seen:.2e} "
-                f"lr_scale:{lr_schedule:.3e} norm:{norm:.3f}",
+                f"lr_scale:{lr_schedule:.3e}",
                 console=True,
             )
             if not args.disable_wandb:
@@ -693,7 +689,6 @@ if __name__ == "__main__":
                     "step_avg": approx_time / timed_steps,
                     "tokens_seen": tokens_seen,
                     "lr": lr_schedule,
-                    "grad_norm": norm,
                 })
 
     # -------------------------------------------------------------------------
