@@ -32,7 +32,7 @@ import wandb
 #only for 2d matrices
 #other dimenional matrices go through AdamW
 def zeropower_via_newtonschulz(G, ns_steps):
-    assert G.dim >= 2
+    assert G.ndim >= 2
     a, b, c = (3.4445, -4.7750,  2.0315)
     X = G.bfloat16()
     #if tall matrix, transpose
@@ -62,15 +62,78 @@ def zeropower_via_newtonschulz(G, ns_steps):
 #rescale
 def muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True):
     #ema
-    momentum.lerp__(grad, 1 - beta)
+    momentum.lerp_(grad, 1 - beta)
     update = grad.lerp_(momentum, beta) if nesterov else momentum
     if update.ndim == 4: # for the case of conv filters
         update = update.view(len(update), -1)
-    update = zeropower_via_newtonschulz(update, steps=ns_steps)
+    update = zeropower_via_newtonschulz(update, ns_steps)
     update *= max(1, update.size(-2) / update.size(-1))**0.5
     return update
 
 
+def adam_update(grad, buf1, buf2, step, betas, eps):
+    buf1.lerp_(grad, 1 - betas[0])
+    buf2.lerp_(grad.square(), 1 - betas[1])
+    buf1c = buf1 / (1 - betas[0]**step)
+    buf2c = buf2 / (1 - betas[1]**step)
+    return buf1c / (buf2c.sqrt() + eps)
+
+
+
+# https://github.com/KellerJordan/Muon/blob/master/muon.py#L228
+class Muon(torch.optim.Optimizer):
+    def __init__(self, param_groups):
+        for group in param_groups:
+            assert "use_muon" in group
+            if group["use_muon"]:
+                # defaults
+                group["lr"] = group.get("lr", 0.02)
+                group["momentum"] = group.get("momentum", 0.95)
+                group["weight_decay"] = group.get("weight_decay", 0)
+                assert set(group.keys()) == set(["params", "lr", "momentum", "weight_decay", "use_muon"])
+            else:
+                # defaults
+                group["lr"] = group.get("lr", 3e-4)
+                group["betas"] = group.get("betas", (0.9, 0.95))
+                group["eps"] = group.get("eps", 1e-10)
+                group["weight_decay"] = group.get("weight_decay", 0)
+                assert set(group.keys()) == set(["params", "lr", "betas", "eps", "weight_decay", "use_muon"])
+        super().__init__(param_groups, dict())
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            if group['use_muon']:
+                #muon update for 2d layers
+                for p in group['params']:
+                    if p.grad is None:
+                        continue
+                    #state to remember prev momentum
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state['momentum_buffer'] = torch.zeros_like(p)
+                    #ema of past gradients
+                    mbuf = state['momentum_buffer']
+                    update = muon_update(p.grad, mbuf, beta=group['momentum'])
+                    #weight decay w ← (1 − lr * weight_decay) w
+                    p.mul_(1 - group['lr'] * group['weight_decay'])
+                    #w ← w + update * -lr
+                    p.add_(update.reshape(p.shape), alpha=-group['lr'])
+
+            else:
+                #adam for linear
+                for p in group['params']:
+                    if p.grad is None:
+                        continue
+                    state = self.state[p]
+                    if len(state) == 0:
+                        state['exp_avg'] = torch.zeros_like(p)
+                        state['exp_avg_sq'] = torch.zeros_like(p)
+                        state['step'] = 0
+                    state['step'] += 1
+                    update = adam_update(p.grad, state['exp_avg'], state['exp_avg_sq'], state['step'], group['betas'], group['eps'])
+                    p.mul_(1 - group['lr'] * group['weight_decay'])
+                    p.add_(update, alpha=-group['lr'])
 
 
 
