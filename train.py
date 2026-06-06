@@ -184,6 +184,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.c_proj.weight.data.zero_()
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -218,7 +219,8 @@ class MLP(nn.Module):
         super().__init__()
         self.c_fc   = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
-
+        self.c_proj.weight.data.zero_()
+        
     def forward(self, x):
         x = self.c_fc(x)
         # https://arxiv.org/abs/2109.08668v2
