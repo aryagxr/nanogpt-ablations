@@ -203,6 +203,8 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rope(q)  
         q = rope_rotate(q, cos, sin)
         k = rope_rotate(k, cos, sin)
+        #QKNorm
+        q, k = rmsnorm(q), rmsnorm(k)
         # now transpose to (B, nh, T, hs) for flash attention
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
@@ -220,7 +222,7 @@ class MLP(nn.Module):
         self.c_fc   = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
         self.c_proj.weight.data.zero_()
-        
+
     def forward(self, x):
         x = self.c_fc(x)
         # https://arxiv.org/abs/2109.08668v2
