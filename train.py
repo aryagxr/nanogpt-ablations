@@ -519,24 +519,29 @@ if __name__ == "__main__":
         )
 
 
-    # Optimizer
+    #Optimizer
     # optimizer = raw_model.configure_optimizers(
     #     weight_decay=args.weight_decay,
     #     learning_rate=args.learning_rate,
     #     betas=(0.9, 0.95),
     #     device_type=device,
     # )
+    param_groups = [
+    dict(params=list(raw_model.transformer.h.parameters()), use_muon=True),
+    dict(params=list(raw_model.lm_head.parameters()), use_muon=False, lr=args.learning_rate, betas=(0.9, 0.95), eps=1e-8, weight_decay=args.weight_decay),
+    ]
+    optimizer = Muon(param_groups)
 
     # LR schedule: linear warmup then linear decay to 10% of peak
     def get_lr(it):
         assert it <= args.num_iterations
         # 1) linear warmup for warmup_iters steps
         if it < args.warmup_iters:
-            return args.learning_rate * (it + 1) / args.warmup_iters
+            return (it + 1) / args.warmup_iters
         decay_ratio = (it - args.warmup_iters) / (args.num_iterations - args.warmup_iters)
         assert 0.0 <= decay_ratio <= 1.0
         # linear decay from 1.0 → 0.1 of peak lr
-        return (0.1 + (1.0 - decay_ratio) * 0.9) * args.learning_rate
+        return (0.1 + (1.0 - decay_ratio) * 0.9)
 
     
     # Training loop
@@ -649,9 +654,12 @@ if __name__ == "__main__":
 
         norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), args.grad_clip)
 
-        lr = get_lr(step)
+        lr_schedule = get_lr(step)
         for pg in optimizer.param_groups:
-            pg['lr'] = lr
+            if pg['use_muon']:
+                pg['lr'] = 0.02 * lr_schedule
+            else:
+                pg['lr'] = args.learning_rate * lr_schedule
         optimizer.step()
 
 
@@ -666,7 +674,7 @@ if __name__ == "__main__":
                 f"train_time:{approx_time:.0f}ms "
                 f"step_avg:{approx_time / timed_steps:.2f}ms "
                 f"tokens_seen:{tokens_seen:.2e} "
-                f"lr:{lr:.2e} norm:{norm:.3f}",
+                f"lr_scale:{lr_schedule:.3e} norm:{norm:.3f}",
                 console=True,
             )
             if not args.disable_wandb:
@@ -676,7 +684,7 @@ if __name__ == "__main__":
                     "step": step + 1,
                     "step_avg": approx_time / timed_steps,
                     "tokens_seen": tokens_seen,
-                    "lr": lr,
+                    "lr": lr_schedule,
                     "grad_norm": norm,
                 })
 
