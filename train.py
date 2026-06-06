@@ -495,7 +495,10 @@ if __name__ == "__main__":
     # Build model
     model_configs = {
         # vocab padded to nearest multiple of 128 for better tensor-core utilisation
-        "d12": GPTConfig(block_size=1024, vocab_size=50304, n_layer=12, n_head=12, n_embd=768),
+        #changing n_heads to 6, so that n_heads(6) x head_dim(128) = n_embd(768)
+        #since 128 head dim better for qknorm
+        #see https://x.com/kellerjordan0/status/1845865698532450646
+        "d12": GPTConfig(block_size=1024, vocab_size=50304, n_layer=12, n_head=6, n_embd=768),
     }
     model = GPT(model_configs[args.model]).train().cuda()
 
