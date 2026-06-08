@@ -66,9 +66,14 @@ def muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True):
     update = grad.lerp_(momentum, beta) if nesterov else momentum
     if update.ndim == 4: # for the case of conv filters
         update = update.view(len(update), -1)
-    update = zeropower_via_newtonschulz(update, ns_steps)
-    update *= max(1, update.size(-2) / update.size(-1))**0.5
-    return update
+    #split grouped QKV parameters
+    if update.size(0) == 3 * update.size(1):
+        update = torch.cat([zeropower_via_newtonschulz(g, ns_steps) for g in update.split(update.size(1))])
+        scale = update.size(1)**0.5
+    else:
+        update = zeropower_via_newtonschulz(update, ns_steps)
+        scale = max(update.size(0), update.size(1))**0.5  #update.square().mean() == 1
+    return update, scale
 
 
 def adam_update(grad, buf1, buf2, step, betas, eps):
@@ -114,11 +119,10 @@ class Muon(torch.optim.Optimizer):
                         state['momentum_buffer'] = torch.zeros_like(p)
                     #ema of past gradients
                     mbuf = state['momentum_buffer']
-                    update = muon_update(p.grad, mbuf, beta=group['momentum'])
+                    update, scale = muon_update(p.grad, mbuf, beta=group['momentum'])
                     #weight decay w ← (1 − lr * weight_decay) w
                     p.mul_(1 - group['lr'] * group['weight_decay'])
-                    #w ← w + update * -lr
-                    p.add_(update.reshape(p.shape), alpha=-group['lr'])
+                    p.add_(update.reshape(p.shape), alpha=-group['lr'] * scale)
 
             else:
                 #adam for linear
@@ -416,8 +420,10 @@ if __name__ == "__main__":
                         help="number of gradient steps (~6.44B tokens at default batch size)")
     # optimisation
     parser.add_argument("--learning_rate", type=float, default=1.5e-3)
-    parser.add_argument("--warmup_iters",  type=int,   default=700,
-                        help="linear LR warmup steps")
+    parser.add_argument("--warmup_iters",  type=int,   default=0,
+                        help="linear LR warmup steps (0 = no warmup, for Muon)")
+    parser.add_argument("--warmdown_iters", type=int, default=1800,
+                        help="linear LR warmdown steps at end of training (trapezoidal schedule)")
     parser.add_argument("--weight_decay",  type=float, default=0.1)
     parser.add_argument("--grad_accum_steps", type=int, default=4,
                         help="gradient accumulation steps (set automatically if 0)")
@@ -539,16 +545,16 @@ if __name__ == "__main__":
     ]
     optimizer = Muon(param_groups)
 
-    # LR schedule: linear warmup then linear decay to 10% of peak
+    # LR schedule: trapezoidal (warmup → constant → linear warmdown to zero)
     def get_lr(it):
         assert it <= args.num_iterations
-        # 1) linear warmup for warmup_iters steps
         if it < args.warmup_iters:
             return (it + 1) / args.warmup_iters
-        decay_ratio = (it - args.warmup_iters) / (args.num_iterations - args.warmup_iters)
-        assert 0.0 <= decay_ratio <= 1.0
-        # linear decay from 1.0 → 0.1 of peak lr
-        return (0.1 + (1.0 - decay_ratio) * 0.9)
+        elif it < args.num_iterations - args.warmdown_iters:
+            return 1.0
+        else:
+            decay_ratio = (args.num_iterations - it) / args.warmdown_iters
+            return decay_ratio
 
     
     # Training loop
@@ -661,7 +667,7 @@ if __name__ == "__main__":
         lr_schedule = get_lr(step)
         for pg in optimizer.param_groups:
             if pg['use_muon']:
-                pg['lr'] = 0.02 * lr_schedule
+                pg['lr'] = 0.1 * args.learning_rate * lr_schedule
             else:
                 pg['lr'] = args.learning_rate * lr_schedule
         optimizer.step()
